@@ -703,7 +703,7 @@ func (bb *blueBubbles) GetMessagesBeforeWithLimit(chatID string, before time.Tim
 		Sort:   MessageQuerySortDesc,
 	}
 
-	messages, err := bb.queryChatMessages(request, []Message{}, false)
+	messages, err := bb.queryChatMessages(request, []Message{}, true)
 	if err != nil {
 		bb.log.Error().Err(err).Interface("request", request).Str("chatID", chatID).Time("before", before).Int("limit", limit).Str("search", "GetMessagesBeforeWithLimit").Msg("Failed to query chat Messages")
 		return nil, err
@@ -747,7 +747,7 @@ func (bb *blueBubbles) GetMessagesWithLimit(chatID string, limit int, backfillID
 		Sort: MessageQuerySortDesc,
 	}
 
-	messages, err := bb.queryChatMessages(request, []Message{}, false)
+	messages, err := bb.queryChatMessages(request, []Message{}, true)
 	if err != nil {
 		bb.log.Error().Err(err).Interface("request", request).Str("chatID", chatID).Int("limit", limit).Str("backfillID", backfillID).Str("search", "GetMessagesWithLimit").Msg("Failed to query chat Messages")
 		return nil, err
