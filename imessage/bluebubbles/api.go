@@ -60,6 +60,9 @@ type blueBubbles struct {
 
 	bbRequestLock sync.Mutex
 
+	imessageAvailability     map[string]imessageAvailabilityEntry
+	imessageAvailabilityLock sync.RWMutex
+
 	usingPrivateAPI bool
 }
 
@@ -75,6 +78,8 @@ func NewBlueBubblesConnector(bridge imessage.Bridge) (imessage.API, error) {
 		contactChan:       make(chan *imessage.Contact, 2048),
 		messageStatusChan: make(chan *imessage.SendMessageStatus, 32),
 		backfillTaskChan:  make(chan *imessage.BackfillTask, 32),
+
+		imessageAvailability: make(map[string]imessageAvailabilityEntry),
 	}, nil
 }
 
@@ -1089,8 +1094,93 @@ func (bb *blueBubbles) BackfillTaskChan() <-chan *imessage.BackfillTask {
 	return bb.backfillTaskChan
 }
 
+// imessageAvailabilityTTL bounds how long a per-address iMessage availability
+// answer is reused. Availability only changes when someone activates or
+// deactivates iMessage on an address, so an hour keeps the common case free
+// while still picking up a newly activated contact reasonably quickly.
+const imessageAvailabilityTTL = time.Hour
+
+type imessageAvailabilityEntry struct {
+	available bool
+	checkedAt time.Time
+}
+
+// isReachableOverIMessage reports whether address can receive iMessages, asking
+// BlueBubbles at most once per imessageAvailabilityTTL. known is false if the
+// answer could not be determined, in which case available is meaningless.
+func (bb *blueBubbles) isReachableOverIMessage(address string) (available bool, known bool) {
+	bb.imessageAvailabilityLock.RLock()
+	entry, cached := bb.imessageAvailability[address]
+	bb.imessageAvailabilityLock.RUnlock()
+	if cached && time.Since(entry.checkedAt) < imessageAvailabilityTTL {
+		return entry.available, true
+	}
+
+	var res HandleAvailabilityResponse
+	if err := bb.apiGet("/api/v1/handle/availability/imessage", map[string]string{"address": address}, &res); err != nil {
+		bb.log.Warn().Err(err).Str("address", address).Msg("Could not check iMessage availability")
+		return false, false
+	}
+	if res.Status != 200 {
+		bb.log.Warn().Int64("statusCode", res.Status).Str("address", address).Msg("iMessage availability check failed")
+		return false, false
+	}
+
+	bb.imessageAvailabilityLock.Lock()
+	bb.imessageAvailability[address] = imessageAvailabilityEntry{available: res.Data.Available, checkedAt: time.Now()}
+	bb.imessageAvailabilityLock.Unlock()
+
+	return res.Data.Available, true
+}
+
+// resolveSendGUID picks the right service for an outgoing chat GUID.
+//
+// With bridge.disable_sms_portals enabled, maybeGetPortalByGUID rewrites
+// "SMS;-;<address>" to "iMessage;-;<address>" so both services share one Matrix
+// room. That rewrite is only safe for receiving: on send it makes the bridge ask
+// Messages to deliver an iMessage to addresses that cannot receive one, which
+// fails with "could not send message".
+//
+// getTargetGUID has a LastSeenHandle fallback for this, but it is gated on the
+// ContactChatMerging capability, which this connector reports as false. Enabling
+// that capability would route by whoever spoke last rather than by what the
+// recipient supports, silently downgrading iMessage contacts to paid SMS after a
+// single inbound text, and would do nothing for chats with no LastSeenHandle yet.
+//
+// So ask BlueBubbles what the address actually supports instead. Fails open: if
+// availability cannot be determined the GUID is left untouched, preserving the
+// previous behaviour.
+func (bb *blueBubbles) resolveSendGUID(chatID string) string {
+	const imessagePrefix = "iMessage;-;"
+	if !strings.HasPrefix(chatID, imessagePrefix) {
+		return chatID
+	}
+	address := strings.TrimPrefix(chatID, imessagePrefix)
+	if address == "" {
+		return chatID
+	}
+	// An email address can only ever be reached over iMessage - SMS has no way to
+	// deliver to one. BlueBubbles reports available=false for an Apple ID whose
+	// email isn't currently registered for iMessage, so without this guard those
+	// chats would be rewritten to a nonsensical "SMS;-;user@example.com".
+	if strings.Contains(address, "@") {
+		return chatID
+	}
+
+	available, known := bb.isReachableOverIMessage(address)
+	if !known || available {
+		return chatID
+	}
+
+	smsGUID := "SMS;-;" + address
+	bb.log.Debug().Str("from", chatID).Str("to", smsGUID).Msg("Address is not reachable over iMessage, sending over SMS")
+	return smsGUID
+}
+
 func (bb *blueBubbles) SendMessage(chatID, text string, replyTo string, replyToPart int, richLink *imessage.RichLink, metadata imessage.MessageMetadata) (*imessage.SendResponse, error) {
 	bb.log.Trace().Str("chatID", chatID).Str("text", text).Str("replyTo", replyTo).Int("replyToPart", replyToPart).Any("richLink", richLink).Interface("metadata", metadata).Msg("SendMessage")
+
+	chatID = bb.resolveSendGUID(chatID)
 
 	var method string
 	if bb.usingPrivateAPI {
@@ -1213,6 +1303,8 @@ func (bb *blueBubbles) isPrivateAPI() bool {
 
 func (bb *blueBubbles) SendFile(chatID, text, filename string, pathOnDisk string, replyTo string, replyToPart int, mimeType string, voiceMemo bool, metadata imessage.MessageMetadata) (*imessage.SendResponse, error) {
 	bb.log.Trace().Str("chatID", chatID).Str("text", text).Str("filename", filename).Str("pathOnDisk", pathOnDisk).Str("replyTo", replyTo).Int("replyToPart", replyToPart).Str("mimeType", mimeType).Bool("voiceMemo", voiceMemo).Interface("metadata", metadata).Msg("SendFile")
+
+	chatID = bb.resolveSendGUID(chatID)
 
 	attachment, err := os.ReadFile(pathOnDisk)
 	if err != nil {
