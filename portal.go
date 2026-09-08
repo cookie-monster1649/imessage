@@ -1778,17 +1778,33 @@ func (portal *Portal) convertIMAttachment(msg *imessage.Message, attach *imessag
 	mimeType := attach.GetMimeType()
 	fileName := attach.GetFileName()
 	extraContent := map[string]interface{}{}
+	var voiceDurationMS int
 
 	if msg.IsAudioMessage {
-		ogg, err := ffmpeg.ConvertBytes(context.TODO(), data, ".ogg", []string{}, []string{"-c:a", "libopus"}, "audio/x-caf")
-		if err == nil {
-			extraContent["org.matrix.msc1767.audio"] = map[string]interface{}{}
-			extraContent["org.matrix.msc3245.voice"] = map[string]interface{}{}
+		ogg, convertErr := ffmpeg.ConvertBytes(context.TODO(), data, ".ogg", []string{}, []string{"-c:a", "libopus"}, "audio/x-caf")
+		if convertErr == nil {
 			mimeType = "audio/ogg"
 			fileName = "Voice Message.ogg"
 			data = ogg
+
+			// `duration` is a required field of org.matrix.msc1767.audio for
+			// ruma-based clients such as Element X: without it the whole event
+			// fails to deserialize ("missing field `duration`") and shows up as
+			// an "Unsupported event" placeholder. If the duration can't be
+			// measured, omit the voice-message blocks entirely so the message
+			// degrades to a plain playable audio file instead of not rendering.
+			durationMS, probeErr := probeAudioDurationMS(context.TODO(), ogg, ".ogg")
+			if probeErr != nil {
+				portal.log.Warnfln("Failed to probe duration of voice message in %s: %v - sending as a plain audio file", msg.GUID, probeErr)
+			} else {
+				voiceDurationMS = durationMS
+				extraContent["org.matrix.msc1767.audio"] = map[string]interface{}{
+					"duration": voiceDurationMS,
+				}
+				extraContent["org.matrix.msc3245.voice"] = map[string]interface{}{}
+			}
 		} else {
-			portal.log.Errorf("Failed to convert audio message to ogg/opus: %v - sending without conversion", err)
+			portal.log.Errorf("Failed to convert audio message to ogg/opus: %v - sending without conversion", convertErr)
 		}
 	}
 
@@ -1860,6 +1876,9 @@ func (portal *Portal) convertIMAttachment(msg *imessage.Message, attach *imessag
 	content.Info = &event.FileInfo{
 		MimeType: mimeType,
 		Size:     len(data),
+	}
+	if voiceDurationMS > 0 {
+		content.Info.Duration = voiceDurationMS
 	}
 	switch strings.Split(mimeType, "/")[0] {
 	case "image":
