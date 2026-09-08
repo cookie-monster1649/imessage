@@ -316,6 +316,15 @@ type ServerInfoResponse struct {
 	Data    ServerInfo `json:"data"`
 }
 
+type HandleAvailabilityResponse struct {
+	Status  int64  `json:"status"`
+	Message string `json:"message"`
+	Data    struct {
+		Available bool `json:"available"`
+	} `json:"data"`
+	Error any `json:"error,omitempty"`
+}
+
 type ResolveIdentifierResponse struct {
 	Status  int64  `json:"status"`
 	Message string `json:"message"`
