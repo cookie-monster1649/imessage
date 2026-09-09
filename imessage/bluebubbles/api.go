@@ -2,6 +2,7 @@ package bluebubbles
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -1558,12 +1559,63 @@ func (bb *blueBubbles) apiURL(path string, queryParams map[string]string) string
 	return url
 }
 
-func (bb *blueBubbles) apiGet(path string, queryParams map[string]string, target interface{}) (err error) {
+// bbRequestTimeout caps an ordinary BlueBubbles API call. BlueBubbles gives up on
+// a stalled private-API transaction after two minutes, so anything beyond that is
+// BlueBubbles itself being wedged rather than a slow send. Without a ceiling the
+// bridge waits forever, and since bbRequestLock serialises every call, a single
+// wedged request stalls every portal.
+const bbRequestTimeout = 3 * time.Minute
+
+// bbAttachmentRequestTimeout is the same ceiling for attachment uploads, which
+// BlueBubbles allows up to twenty minutes to land.
+const bbAttachmentRequestTimeout = 30 * time.Minute
+
+// bbHTTPClient is shared so connections are pooled across calls. Deadlines are
+// per-request via context rather than on the client, because attachment uploads
+// need a much longer budget than everything else.
+var bbHTTPClient = &http.Client{}
+
+// do runs req while holding bbRequestLock, applying timeout to the request only.
+// The deadline starts after the lock is acquired so that a call queued behind a
+// slow one still gets its full budget rather than being starved by lock wait.
+func (bb *blueBubbles) do(req *http.Request, timeout time.Duration) (*http.Response, error) {
+	bb.bbRequestLock.Lock()
+	defer bb.bbRequestLock.Unlock()
+
+	ctx, cancel := context.WithTimeout(req.Context(), timeout)
+	defer cancel()
+
+	response, err := bbHTTPClient.Do(req.WithContext(ctx))
+	if err != nil {
+		return nil, err
+	}
+
+	// The body has to be drained before the deadline is cancelled, so read it here
+	// rather than handing a half-consumed response back to the caller.
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	response.Body = io.NopCloser(bytes.NewReader(body))
+
+	return response, nil
+}
+
+func (bb *blueBubbles) apiGet(path string, queryParams map[string]string, target interface{}) error {
+	return bb.apiGetWithTimeout(path, queryParams, target, bbRequestTimeout)
+}
+
+func (bb *blueBubbles) apiGetWithTimeout(path string, queryParams map[string]string, target interface{}, timeout time.Duration) (err error) {
 	url := bb.apiURL(path, queryParams)
 
-	bb.bbRequestLock.Lock()
-	response, err := http.Get(url)
-	bb.bbRequestLock.Unlock()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		bb.log.Error().Err(err).Msg("Error creating GET request")
+		return err
+	}
+
+	response, err := bb.do(req, timeout)
 	if err != nil {
 		bb.log.Error().Err(err).Msg("Error making GET request")
 		return err
@@ -1612,10 +1664,7 @@ func (bb *blueBubbles) apiRequest(method, path string, payload interface{}, targ
 
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
-	bb.bbRequestLock.Lock()
-	response, err := client.Do(req)
-	bb.bbRequestLock.Unlock()
+	response, err := bb.do(req, bbRequestTimeout)
 	if err != nil {
 		bb.log.Error().Err(err).Str("method", method).Msg("Error making request")
 		return err
@@ -1669,9 +1718,14 @@ func (bb *blueBubbles) apiPostAsFormData(path string, formData map[string]interf
 	writer.Close()
 
 	// Make the HTTP POST request
-	bb.bbRequestLock.Lock()
-	response, err := http.Post(url, writer.FormDataContentType(), &body)
-	bb.bbRequestLock.Unlock()
+	req, err := http.NewRequest(http.MethodPost, url, &body)
+	if err != nil {
+		bb.log.Error().Err(err).Msg("Error creating POST request")
+		return err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	response, err := bb.do(req, bbAttachmentRequestTimeout)
 	if err != nil {
 		bb.log.Error().Err(err).Msg("Error making POST request")
 		return err
