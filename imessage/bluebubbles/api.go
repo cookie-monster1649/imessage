@@ -1118,9 +1118,34 @@ func (bb *blueBubbles) BackfillTaskChan() <-chan *imessage.BackfillTask {
 // while still picking up a newly activated contact reasonably quickly.
 const imessageAvailabilityTTL = time.Hour
 
+// imessageAvailabilityFailureTTL bounds how long a failed lookup is remembered.
+// The check runs through the private API, so when the Messages helper is not
+// answering it costs a full BlueBubbles transaction timeout (two minutes). Not
+// caching that outcome makes every outgoing message pay it again, on top of the
+// same timeout for the send itself. Remember failures briefly so an unhealthy
+// Messages degrades to one slow lookup per address per interval rather than one
+// per message, and retry often enough to recover promptly once it is back.
+const imessageAvailabilityFailureTTL = 5 * time.Minute
+
+// imessageAvailabilityTimeout caps a single availability lookup. Routing is a
+// best-effort optimisation and fails open, so there is no reason to wait out
+// BlueBubbles' two minute transaction timeout for it.
+const imessageAvailabilityTimeout = 15 * time.Second
+
 type imessageAvailabilityEntry struct {
 	available bool
+	// known records whether the lookup succeeded. Failures are cached too, with a
+	// shorter TTL, so they have to be distinguished from a genuine "no".
+	known     bool
 	checkedAt time.Time
+}
+
+func (e imessageAvailabilityEntry) fresh() bool {
+	ttl := imessageAvailabilityTTL
+	if !e.known {
+		ttl = imessageAvailabilityFailureTTL
+	}
+	return time.Since(e.checkedAt) < ttl
 }
 
 // isReachableOverIMessage reports whether address can receive iMessages, asking
@@ -1130,25 +1155,33 @@ func (bb *blueBubbles) isReachableOverIMessage(address string) (available bool, 
 	bb.imessageAvailabilityLock.RLock()
 	entry, cached := bb.imessageAvailability[address]
 	bb.imessageAvailabilityLock.RUnlock()
-	if cached && time.Since(entry.checkedAt) < imessageAvailabilityTTL {
-		return entry.available, true
+	if cached && entry.fresh() {
+		return entry.available, entry.known
+	}
+
+	remember := func(avail, ok bool) (bool, bool) {
+		bb.imessageAvailabilityLock.Lock()
+		bb.imessageAvailability[address] = imessageAvailabilityEntry{
+			available: avail,
+			known:     ok,
+			checkedAt: time.Now(),
+		}
+		bb.imessageAvailabilityLock.Unlock()
+		return avail, ok
 	}
 
 	var res HandleAvailabilityResponse
-	if err := bb.apiGet("/api/v1/handle/availability/imessage", map[string]string{"address": address}, &res); err != nil {
+	err := bb.apiGetWithTimeout("/api/v1/handle/availability/imessage", map[string]string{"address": address}, &res, imessageAvailabilityTimeout)
+	if err != nil {
 		bb.log.Warn().Err(err).Str("address", address).Msg("Could not check iMessage availability")
-		return false, false
+		return remember(false, false)
 	}
 	if res.Status != 200 {
 		bb.log.Warn().Int64("statusCode", res.Status).Str("address", address).Msg("iMessage availability check failed")
-		return false, false
+		return remember(false, false)
 	}
 
-	bb.imessageAvailabilityLock.Lock()
-	bb.imessageAvailability[address] = imessageAvailabilityEntry{available: res.Data.Available, checkedAt: time.Now()}
-	bb.imessageAvailabilityLock.Unlock()
-
-	return res.Data.Available, true
+	return remember(res.Data.Available, true)
 }
 
 // resolveSendGUID picks the right service for an outgoing chat GUID.
