@@ -540,32 +540,49 @@ func (bb *blueBubbles) queryChatMessages(query MessageQueryRequest, allResults [
 
 	allResults = append(allResults, resp.Data...)
 
+	// Max is the caller's ceiling on the total number of messages (it carries
+	// backfill.initial_limit), not a per-page cap. Metadata.Total is the number of
+	// messages matching the query in the whole chat, so bounding the walk on Total
+	// alone pulls the entire chat history and ignores Max completely.
+	//
+	// A non-nil Max always bounds the walk, including zero: handleBackfillRequest
+	// routes MaxTotalEvents >= 0 here and only negative values mean "no ceiling",
+	// so a zero (which is also what a NULL max_total_events decodes to) means no
+	// messages, not all of them. Callers that genuinely want everything in a date
+	// range leave Max nil.
+	if query.Max != nil && len(allResults) >= *query.Max {
+		return allResults[:*query.Max], nil
+	}
+
+	// An empty page means the server has nothing more to give, whatever Total says.
+	// Without this an offset that stops advancing would recurse forever.
+	if len(resp.Data) == 0 {
+		return allResults, nil
+	}
+
 	nextPageOffset := resp.Metadata.Offset + resp.Metadata.Limit
-
-	// Determine the limit for the next page
-	var nextLimit int
-	if query.Max != nil && *query.Max > 0 {
-		nextLimit = int(math.Min(float64(*query.Max), 1000))
-	} else {
-		nextLimit = 1000
+	if !paginate || nextPageOffset >= resp.Metadata.Total {
+		return allResults, nil
 	}
 
-	// If there are more messages to fetch and pagination is enabled
-	if paginate && (nextPageOffset < resp.Metadata.Total) {
-		// If the next page offset exceeds the maximum limit, adjust the query
-		if nextLimit > 0 && nextPageOffset+int64(nextLimit) > resp.Metadata.Total {
-			nextLimit = int(resp.Metadata.Total - nextPageOffset)
+	// Ask for a full page, trimmed to whichever of Max or Total we reach first.
+	nextLimit := int64(1000)
+	if query.Max != nil {
+		if remaining := int64(*query.Max - len(allResults)); remaining < nextLimit {
+			nextLimit = remaining
 		}
-
-		// Update the query with the new offset and limit
-		query.Offset = int(nextPageOffset)
-		query.Limit = nextLimit
-
-		// Recursively call the function for the next page
-		return bb.queryChatMessages(query, allResults, paginate)
+	}
+	if remaining := resp.Metadata.Total - nextPageOffset; remaining < nextLimit {
+		nextLimit = remaining
+	}
+	if nextLimit <= 0 {
+		return allResults, nil
 	}
 
-	return allResults, nil
+	query.Offset = int(nextPageOffset)
+	query.Limit = int(nextLimit)
+
+	return bb.queryChatMessages(query, allResults, paginate)
 }
 
 func (bb *blueBubbles) messageQueryRequestToMap(req *MessageQueryRequest) map[string]string {
