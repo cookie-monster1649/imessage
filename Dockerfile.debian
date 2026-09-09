@@ -1,0 +1,63 @@
+# syntax=docker/dockerfile:1
+
+# A self-contained Debian trixie image for the bridge.
+#
+# Dockerfile.ci expects a binary that has already been built on the host; this
+# one builds it, so it works as a plain `docker build` from a checkout. The
+# builder and the runtime share a Debian trixie base on purpose: mautrix-go's
+# crypto package is cgo and links against libolm and glibc, so building on a
+# different release than the one that runs the binary risks a version mismatch.
+
+ARG GO_VERSION=1.25
+
+FROM golang:${GO_VERSION}-trixie AS builder
+
+# libolm-dev provides olm/olm.h, which mautrix-go/crypto/olm needs to compile.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libolm-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Resolve dependencies in their own layer so that editing the bridge source does
+# not invalidate the module cache.
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# go.mod pins a `toolchain` line newer than nothing in this image needs; without
+# GOTOOLCHAIN=local the build reaches out to download a second toolchain. The
+# image's Go already satisfies the `go` directive.
+ENV GOTOOLCHAIN=local CGO_ENABLED=1
+
+ARG VERSION=unknown
+ARG COMMIT=unknown
+RUN go build \
+      -ldflags "-X main.Tag=${VERSION} -X main.Commit=${COMMIT} -X 'main.BuildTime=$(date -u '+%b %_d %Y, %H:%M:%S')'" \
+      -o /build/mautrix-imessage \
+ && /build/mautrix-imessage --version
+
+FROM debian:trixie-slim
+
+# ffmpeg supplies both the libopus encoder used to convert voice messages and the
+# ffprobe binary the duration lookup shells out to. libolm3 is the runtime half
+# of libolm-dev above.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      ffmpeg \
+      libolm3 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/mautrix-imessage /usr/bin/mautrix-imessage
+COPY --from=builder /build/example-config.yaml /opt/mautrix-imessage/example-config.yaml
+
+VOLUME /data
+WORKDIR /data
+
+# The binary is the entrypoint rather than a wrapper script, so flags can be
+# passed straight through from `docker run` or a compose `command:`. Generate a
+# registration with `-g -c /data/config.yaml -r /data/registration.yaml`.
+ENTRYPOINT ["/usr/bin/mautrix-imessage"]
+CMD ["-c", "/data/config.yaml"]

@@ -2,6 +2,7 @@ package bluebubbles
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -540,32 +541,49 @@ func (bb *blueBubbles) queryChatMessages(query MessageQueryRequest, allResults [
 
 	allResults = append(allResults, resp.Data...)
 
+	// Max is the caller's ceiling on the total number of messages (it carries
+	// backfill.initial_limit), not a per-page cap. Metadata.Total is the number of
+	// messages matching the query in the whole chat, so bounding the walk on Total
+	// alone pulls the entire chat history and ignores Max completely.
+	//
+	// A non-nil Max always bounds the walk, including zero: handleBackfillRequest
+	// routes MaxTotalEvents >= 0 here and only negative values mean "no ceiling",
+	// so a zero (which is also what a NULL max_total_events decodes to) means no
+	// messages, not all of them. Callers that genuinely want everything in a date
+	// range leave Max nil.
+	if query.Max != nil && len(allResults) >= *query.Max {
+		return allResults[:*query.Max], nil
+	}
+
+	// An empty page means the server has nothing more to give, whatever Total says.
+	// Without this an offset that stops advancing would recurse forever.
+	if len(resp.Data) == 0 {
+		return allResults, nil
+	}
+
 	nextPageOffset := resp.Metadata.Offset + resp.Metadata.Limit
-
-	// Determine the limit for the next page
-	var nextLimit int
-	if query.Max != nil && *query.Max > 0 {
-		nextLimit = int(math.Min(float64(*query.Max), 1000))
-	} else {
-		nextLimit = 1000
+	if !paginate || nextPageOffset >= resp.Metadata.Total {
+		return allResults, nil
 	}
 
-	// If there are more messages to fetch and pagination is enabled
-	if paginate && (nextPageOffset < resp.Metadata.Total) {
-		// If the next page offset exceeds the maximum limit, adjust the query
-		if nextLimit > 0 && nextPageOffset+int64(nextLimit) > resp.Metadata.Total {
-			nextLimit = int(resp.Metadata.Total - nextPageOffset)
+	// Ask for a full page, trimmed to whichever of Max or Total we reach first.
+	nextLimit := int64(1000)
+	if query.Max != nil {
+		if remaining := int64(*query.Max - len(allResults)); remaining < nextLimit {
+			nextLimit = remaining
 		}
-
-		// Update the query with the new offset and limit
-		query.Offset = int(nextPageOffset)
-		query.Limit = nextLimit
-
-		// Recursively call the function for the next page
-		return bb.queryChatMessages(query, allResults, paginate)
+	}
+	if remaining := resp.Metadata.Total - nextPageOffset; remaining < nextLimit {
+		nextLimit = remaining
+	}
+	if nextLimit <= 0 {
+		return allResults, nil
 	}
 
-	return allResults, nil
+	query.Offset = int(nextPageOffset)
+	query.Limit = int(nextLimit)
+
+	return bb.queryChatMessages(query, allResults, paginate)
 }
 
 func (bb *blueBubbles) messageQueryRequestToMap(req *MessageQueryRequest) map[string]string {
@@ -1100,9 +1118,34 @@ func (bb *blueBubbles) BackfillTaskChan() <-chan *imessage.BackfillTask {
 // while still picking up a newly activated contact reasonably quickly.
 const imessageAvailabilityTTL = time.Hour
 
+// imessageAvailabilityFailureTTL bounds how long a failed lookup is remembered.
+// The check runs through the private API, so when the Messages helper is not
+// answering it costs a full BlueBubbles transaction timeout (two minutes). Not
+// caching that outcome makes every outgoing message pay it again, on top of the
+// same timeout for the send itself. Remember failures briefly so an unhealthy
+// Messages degrades to one slow lookup per address per interval rather than one
+// per message, and retry often enough to recover promptly once it is back.
+const imessageAvailabilityFailureTTL = 5 * time.Minute
+
+// imessageAvailabilityTimeout caps a single availability lookup. Routing is a
+// best-effort optimisation and fails open, so there is no reason to wait out
+// BlueBubbles' two minute transaction timeout for it.
+const imessageAvailabilityTimeout = 15 * time.Second
+
 type imessageAvailabilityEntry struct {
 	available bool
+	// known records whether the lookup succeeded. Failures are cached too, with a
+	// shorter TTL, so they have to be distinguished from a genuine "no".
+	known     bool
 	checkedAt time.Time
+}
+
+func (e imessageAvailabilityEntry) fresh() bool {
+	ttl := imessageAvailabilityTTL
+	if !e.known {
+		ttl = imessageAvailabilityFailureTTL
+	}
+	return time.Since(e.checkedAt) < ttl
 }
 
 // isReachableOverIMessage reports whether address can receive iMessages, asking
@@ -1112,25 +1155,33 @@ func (bb *blueBubbles) isReachableOverIMessage(address string) (available bool, 
 	bb.imessageAvailabilityLock.RLock()
 	entry, cached := bb.imessageAvailability[address]
 	bb.imessageAvailabilityLock.RUnlock()
-	if cached && time.Since(entry.checkedAt) < imessageAvailabilityTTL {
-		return entry.available, true
+	if cached && entry.fresh() {
+		return entry.available, entry.known
+	}
+
+	remember := func(avail, ok bool) (bool, bool) {
+		bb.imessageAvailabilityLock.Lock()
+		bb.imessageAvailability[address] = imessageAvailabilityEntry{
+			available: avail,
+			known:     ok,
+			checkedAt: time.Now(),
+		}
+		bb.imessageAvailabilityLock.Unlock()
+		return avail, ok
 	}
 
 	var res HandleAvailabilityResponse
-	if err := bb.apiGet("/api/v1/handle/availability/imessage", map[string]string{"address": address}, &res); err != nil {
+	err := bb.apiGetWithTimeout("/api/v1/handle/availability/imessage", map[string]string{"address": address}, &res, imessageAvailabilityTimeout)
+	if err != nil {
 		bb.log.Warn().Err(err).Str("address", address).Msg("Could not check iMessage availability")
-		return false, false
+		return remember(false, false)
 	}
 	if res.Status != 200 {
 		bb.log.Warn().Int64("statusCode", res.Status).Str("address", address).Msg("iMessage availability check failed")
-		return false, false
+		return remember(false, false)
 	}
 
-	bb.imessageAvailabilityLock.Lock()
-	bb.imessageAvailability[address] = imessageAvailabilityEntry{available: res.Data.Available, checkedAt: time.Now()}
-	bb.imessageAvailabilityLock.Unlock()
-
-	return res.Data.Available, true
+	return remember(res.Data.Available, true)
 }
 
 // resolveSendGUID picks the right service for an outgoing chat GUID.
@@ -1541,12 +1592,63 @@ func (bb *blueBubbles) apiURL(path string, queryParams map[string]string) string
 	return url
 }
 
-func (bb *blueBubbles) apiGet(path string, queryParams map[string]string, target interface{}) (err error) {
+// bbRequestTimeout caps an ordinary BlueBubbles API call. BlueBubbles gives up on
+// a stalled private-API transaction after two minutes, so anything beyond that is
+// BlueBubbles itself being wedged rather than a slow send. Without a ceiling the
+// bridge waits forever, and since bbRequestLock serialises every call, a single
+// wedged request stalls every portal.
+const bbRequestTimeout = 3 * time.Minute
+
+// bbAttachmentRequestTimeout is the same ceiling for attachment uploads, which
+// BlueBubbles allows up to twenty minutes to land.
+const bbAttachmentRequestTimeout = 30 * time.Minute
+
+// bbHTTPClient is shared so connections are pooled across calls. Deadlines are
+// per-request via context rather than on the client, because attachment uploads
+// need a much longer budget than everything else.
+var bbHTTPClient = &http.Client{}
+
+// do runs req while holding bbRequestLock, applying timeout to the request only.
+// The deadline starts after the lock is acquired so that a call queued behind a
+// slow one still gets its full budget rather than being starved by lock wait.
+func (bb *blueBubbles) do(req *http.Request, timeout time.Duration) (*http.Response, error) {
+	bb.bbRequestLock.Lock()
+	defer bb.bbRequestLock.Unlock()
+
+	ctx, cancel := context.WithTimeout(req.Context(), timeout)
+	defer cancel()
+
+	response, err := bbHTTPClient.Do(req.WithContext(ctx))
+	if err != nil {
+		return nil, err
+	}
+
+	// The body has to be drained before the deadline is cancelled, so read it here
+	// rather than handing a half-consumed response back to the caller.
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	response.Body = io.NopCloser(bytes.NewReader(body))
+
+	return response, nil
+}
+
+func (bb *blueBubbles) apiGet(path string, queryParams map[string]string, target interface{}) error {
+	return bb.apiGetWithTimeout(path, queryParams, target, bbRequestTimeout)
+}
+
+func (bb *blueBubbles) apiGetWithTimeout(path string, queryParams map[string]string, target interface{}, timeout time.Duration) (err error) {
 	url := bb.apiURL(path, queryParams)
 
-	bb.bbRequestLock.Lock()
-	response, err := http.Get(url)
-	bb.bbRequestLock.Unlock()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		bb.log.Error().Err(err).Msg("Error creating GET request")
+		return err
+	}
+
+	response, err := bb.do(req, timeout)
 	if err != nil {
 		bb.log.Error().Err(err).Msg("Error making GET request")
 		return err
@@ -1595,10 +1697,7 @@ func (bb *blueBubbles) apiRequest(method, path string, payload interface{}, targ
 
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
-	bb.bbRequestLock.Lock()
-	response, err := client.Do(req)
-	bb.bbRequestLock.Unlock()
+	response, err := bb.do(req, bbRequestTimeout)
 	if err != nil {
 		bb.log.Error().Err(err).Str("method", method).Msg("Error making request")
 		return err
@@ -1652,9 +1751,14 @@ func (bb *blueBubbles) apiPostAsFormData(path string, formData map[string]interf
 	writer.Close()
 
 	// Make the HTTP POST request
-	bb.bbRequestLock.Lock()
-	response, err := http.Post(url, writer.FormDataContentType(), &body)
-	bb.bbRequestLock.Unlock()
+	req, err := http.NewRequest(http.MethodPost, url, &body)
+	if err != nil {
+		bb.log.Error().Err(err).Msg("Error creating POST request")
+		return err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	response, err := bb.do(req, bbAttachmentRequestTimeout)
 	if err != nil {
 		bb.log.Error().Err(err).Msg("Error making POST request")
 		return err
